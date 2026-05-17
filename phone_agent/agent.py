@@ -16,6 +16,19 @@ from phone_agent.model.client import MessageBuilder
 from phone_agent.observation import ObservationSheet, build_contact_sheet
 
 
+def _emit_worker_event(payload: dict) -> None:
+    """Emit a structured marker line to stdout for the supervising server.
+
+    The line format is `AUTOGLM_WORKER_EVENT <json>` so that the server-side
+    stdout observer (see server/app/agent/autoglm_runner.py and Watchdog)
+    can parse worker telemetry out of an otherwise free-text log stream.
+    """
+    print(
+        "AUTOGLM_WORKER_EVENT " + json.dumps(payload, ensure_ascii=False),
+        flush=True,
+    )
+
+
 @dataclass
 class AgentConfig:
     """Configuration for the PhoneAgent."""
@@ -125,16 +138,16 @@ class PhoneAgent:
         result = self._execute_step(task, is_first=True)
 
         if result.finished:
-            return result.message or "Task completed"
+            return self._emit_run_result(result.message or "Task completed")
 
         # Continue until finished or max steps reached
         while self._step_count < self.agent_config.max_steps:
             result = self._execute_step(is_first=False)
 
             if result.finished:
-                return result.message or "Task completed"
+                return self._emit_run_result(result.message or "Task completed")
 
-        return "Max steps reached"
+        return self._emit_run_result("Max steps reached")
 
     def step(self, task: str | None = None) -> StepResult:
         """
@@ -245,6 +258,21 @@ class PhoneAgent:
             print(json.dumps(action, ensure_ascii=False, indent=2))
             print("=" * 50 + "\n")
 
+        # Structured marker for the supervising server (W2a-3).
+        # Format: `AUTOGLM_WORKER_EVENT <json>` on a single line so the parent
+        # process can split it from free-text log lines without false positives.
+        thinking = getattr(response, "thinking", "") or ""
+        _emit_worker_event(
+            {
+                "type": "step_start",
+                "step": self._step_count,
+                "action": action,
+                "thinking_excerpt": thinking[-500:],
+                "screenshot_size": [screenshot.width, screenshot.height],
+                "ts": time.time(),
+            }
+        )
+
         # Remove image from context to save space
         self._context[-1] = MessageBuilder.remove_images_from_message(self._context[-1])
 
@@ -289,6 +317,22 @@ class PhoneAgent:
             thinking=response.thinking,
             message=result.message or action.get("message"),
         )
+
+    def _emit_run_result(self, message: str) -> str:
+        """Emit the terminal run_result marker and pass the message through.
+
+        Called at every `run()` exit point so the supervising server (W2b-3)
+        sees a stable terminal event regardless of whether the worker finished
+        naturally, hit max_steps, or returned early.
+        """
+        _emit_worker_event(
+            {
+                "type": "run_result",
+                "step_count": self._step_count,
+                "result": message,
+            }
+        )
+        return message
 
     def _capture_post_action_observation(
         self, device_factory: Any, action: dict[str, Any]
