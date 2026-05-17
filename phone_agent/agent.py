@@ -1,8 +1,10 @@
 """Main PhoneAgent class for orchestrating phone automation."""
 
 import json
+import os
+import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from phone_agent.actions import ActionHandler
@@ -11,6 +13,7 @@ from phone_agent.config import get_messages, get_system_prompt
 from phone_agent.device_factory import get_device_factory
 from phone_agent.model import ModelClient, ModelConfig
 from phone_agent.model.client import MessageBuilder
+from phone_agent.observation import ObservationSheet, build_contact_sheet
 
 
 @dataclass
@@ -22,6 +25,28 @@ class AgentConfig:
     lang: str = "cn"
     system_prompt: str | None = None
     verbose: bool = True
+    observation_burst_enabled: bool = field(
+        default_factory=lambda: os.getenv("PHONE_AGENT_OBSERVATION_BURST_ENABLED", "1")
+        not in {"0", "false", "False"}
+    )
+    observation_delays: list[float] = field(
+        default_factory=lambda: [
+            float(value.strip())
+            for value in os.getenv(
+                "PHONE_AGENT_OBSERVATION_DELAYS", "0.2,0.7,1.2,1.7"
+            ).split(",")
+            if value.strip()
+        ]
+    )
+    observation_actions: set[str] = field(
+        default_factory=lambda: {
+            value.strip()
+            for value in os.getenv(
+                "PHONE_AGENT_OBSERVATION_ACTIONS", "Tap,Type,Back,Wait,Launch"
+            ).split(",")
+            if value.strip()
+        }
+    )
 
     def __post_init__(self):
         if self.system_prompt is None:
@@ -80,6 +105,7 @@ class PhoneAgent:
 
         self._context: list[dict[str, Any]] = []
         self._step_count = 0
+        self._pending_observation: ObservationSheet | None = None
 
     def run(self, task: str) -> str:
         """
@@ -93,6 +119,7 @@ class PhoneAgent:
         """
         self._context = []
         self._step_count = 0
+        self._pending_observation = None
 
         # First step with user prompt
         result = self._execute_step(task, is_first=True)
@@ -132,6 +159,7 @@ class PhoneAgent:
         """Reset the agent state for a new task."""
         self._context = []
         self._step_count = 0
+        self._pending_observation = None
 
     def _execute_step(
         self, user_prompt: str | None = None, is_first: bool = False
@@ -143,6 +171,8 @@ class PhoneAgent:
         device_factory = get_device_factory()
         screenshot = device_factory.get_screenshot(self.agent_config.device_id)
         current_app = device_factory.get_current_app(self.agent_config.device_id)
+        pending_observation = self._pending_observation
+        self._pending_observation = None
 
         # Build messages
         if is_first:
@@ -161,10 +191,24 @@ class PhoneAgent:
         else:
             screen_info = MessageBuilder.build_screen_info(current_app)
             text_content = f"** Screen Info **\n\n{screen_info}"
+            extra_images: list[str] = []
+            if pending_observation is not None:
+                extra_images.append(pending_observation.base64_data)
+                text_content += (
+                    "\n\n** Post-action observation **\n"
+                    "The second image is a post-action observation sheet captured shortly "
+                    "after the previous action. It may show transient toast messages, "
+                    "validation errors, popups, loading states, or brief UI feedback. "
+                    "If it shows an error, treat that as the latest result of the previous "
+                    "action and do not repeat the same action blindly. Coordinates must "
+                    "refer to the current screen in the first image, not the observation sheet."
+                )
 
             self._context.append(
                 MessageBuilder.create_user_message(
-                    text=text_content, image_base64=screenshot.base64_data
+                    text=text_content,
+                    image_base64=screenshot.base64_data,
+                    extra_image_base64=extra_images,
                 )
             )
 
@@ -209,6 +253,10 @@ class PhoneAgent:
             result = self.action_handler.execute(
                 action, screenshot.width, screenshot.height
             )
+            if result.success:
+                self._pending_observation = self._capture_post_action_observation(
+                    device_factory, action
+                )
         except Exception as e:
             if self.agent_config.verbose:
                 traceback.print_exc()
@@ -241,6 +289,30 @@ class PhoneAgent:
             thinking=response.thinking,
             message=result.message or action.get("message"),
         )
+
+    def _capture_post_action_observation(
+        self, device_factory: Any, action: dict[str, Any]
+    ) -> ObservationSheet | None:
+        if not self.agent_config.observation_burst_enabled:
+            return None
+        if action.get("_metadata") != "do":
+            return None
+        action_name = action.get("action")
+        if action_name not in self.agent_config.observation_actions:
+            return None
+
+        frames = []
+        previous_delay = 0.0
+        for delay in self.agent_config.observation_delays[:4]:
+            wait_time = max(0.0, delay - previous_delay)
+            if wait_time > 0:
+                time.sleep(wait_time)
+            previous_delay = delay
+            screenshot = device_factory.get_screenshot(self.agent_config.device_id)
+            frames.append((screenshot, f"t+{delay:.1f}s"))
+        if not frames:
+            return None
+        return build_contact_sheet(frames)
 
     @property
     def context(self) -> list[dict[str, Any]]:

@@ -312,7 +312,9 @@ class MessageBuilder:
 
     @staticmethod
     def create_user_message(
-        text: str, image_base64: str | None = None
+        text: str,
+        image_base64: str | None = None,
+        extra_image_base64: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Create a user message with optional image.
@@ -331,6 +333,13 @@ class MessageBuilder:
                 {
                     "type": "image_url",
                     "image_url": {"url": f"data:image/png;base64,{image_base64}"},
+                }
+            )
+        for extra_image in extra_image_base64 or []:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{extra_image}"},
                 }
             )
 
